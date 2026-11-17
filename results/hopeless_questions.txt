@@ -1,0 +1,18 @@
+== hotpotqa
+gold passages | questions | sufficient by hop 4 | avg hops spent (learned, tau=0.5)
+            2 |      1000 |               74.5% | 2.20
+never sufficient: 255 questions, learned policy spends 3.09 hops on them on average (an oracle would stop at hop 1)
+
+== 2wikimultihopqa
+gold passages | questions | sufficient by hop 4 | avg hops spent (learned, tau=0.5)
+            2 |       765 |               68.4% | 2.44
+            4 |       235 |                3.4% | 3.81
+never sufficient: 469 questions, learned policy spends 3.57 hops on them on average (an oracle would stop at hop 1)
+
+== musique
+gold passages | questions | sufficient by hop 4 | avg hops spent (learned, tau=0.5)
+            2 |       518 |               32.8% | 3.91
+            3 |       316 |                3.5% | 4.00
+            4 |       166 |                0.6% | 4.00
+never sufficient: 818 questions, learned policy spends 3.96 hops on them on average (an oracle would stop at hop 1)
+
