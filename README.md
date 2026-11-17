@@ -239,3 +239,7 @@ results/           metrics.json, results_tables.md, figures, per-hop feature tab
   (Gutierrez et al., 2024). The datasets keep their original licences; check each dataset's
   page before redistributing the data. The raw files are not included in this repository.
 - BM25 follows the Okapi formulation as implemented in the `rank_bm25` package.
+
+##  License
+
+MIT, see `LICENSE`.
