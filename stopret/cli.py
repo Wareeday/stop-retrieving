@@ -24,10 +24,12 @@ def main() -> None:
     p_run.add_argument("--rebuild", action="store_true",
                        help="recompute the retrieval trajectories instead of reusing the CSVs")
 
-    p_j = sub.add_parser("judge", help="optional: LLM-judge stopping baseline through Ollama")
-    p_j.add_argument("--model", required=True, help="Ollama model name, e.g. llama3.2:3b")
+    p_j = sub.add_parser("judge", help="optional: LLM-judge stopping baseline through Ollama or Groq")
+    p_j.add_argument("--provider", choices=["ollama", "groq"], default="ollama")
+    p_j.add_argument("--model", required=True, help="Model name, e.g. llama3.2:3b or llama-3.3-70b-versatile")
     p_j.add_argument("--n", type=int, default=200, help="number of HotpotQA questions to judge")
-    p_j.add_argument("--host", default="http://localhost:11434")
+    p_j.add_argument("--host", default=None)
+    p_j.add_argument("--api-key", default=None, help="Groq API key (or set GROQ_API_KEY env var)")
     p_j.add_argument("--data-dir", default="data/raw")
     p_j.add_argument("--out-dir", default="results")
 
@@ -38,10 +40,15 @@ def main() -> None:
     if args.command == "download":
         download(args.data_dir)
     elif args.command == "run":
-        metrics = run_all(args.data_dir, args.out_dir, args.rebuild)
-        _write_outputs(metrics, Path(args.out_dir))
     elif args.command == "judge":
-        print(json.dumps(run_llm_judge(args.model, args.n, args.host, args.data_dir, args.out_dir),
+        host = args.host or (
+            "https://api.groq.com/openai/v1" if args.provider == "groq" else "http://localhost:11434"
+        )
+        print(json.dumps(
+            run_llm_judge(args.model, args.n, host, args.data_dir, args.out_dir,
+                          provider=args.provider, api_key=args.api_key),
+            indent=1,
+        ))        print(json.dumps(run_llm_judge(args.model, args.n, args.host, args.data_dir, args.out_dir),
                          indent=1))
     elif args.command == "report":
         out = Path(args.out_dir)

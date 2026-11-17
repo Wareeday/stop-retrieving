@@ -53,3 +53,27 @@ class OllamaJudge:
             if self.cache_path:
                 self.cache_path.write_text(json.dumps(self.cache))
         return verdict
+
+# --- Groq / Grok Cloud Judge Section ---
+import os
+
+
+class GroqJudge(OllamaJudge):
+    def __init__(self, model: str = "llama-3.3-70b-versatile", api_key: str | None = None,
+                 host: str = "https://api.groq.com/openai/v1", timeout: float = 300.0,
+                 cache_path: str | Path | None = None):
+        super().__init__(model=model, host=host, timeout=timeout, cache_path=cache_path)
+        self.api_key = api_key or os.environ.get("GROQ_API_KEY") or os.environ.get("XAI_API_KEY", "")
+
+    def _generate(self, prompt: str) -> str:
+        body = json.dumps({"model": self.model,
+                           "messages": [{"role": "user", "content": prompt}],
+                           "temperature": 0, "max_tokens": 4}).encode()
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+            "User-Agent": "stopret/1.0",
+        }
+        request = urllib.request.Request(f"{self.host}/chat/completions", data=body, headers=headers)
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            return json.loads(response.read())["choices"][0]["message"]["content"]
