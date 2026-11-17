@@ -242,4 +242,4 @@ results/           metrics.json, results_tables.md, figures, per-hop feature tab
 
 ##  License
 
-MIT, see `LICENSE`.
+MIT
