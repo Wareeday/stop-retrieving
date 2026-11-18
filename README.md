@@ -183,8 +183,9 @@ I would not claim the give-up rule works. It is a diagnosis with a partial fix.
 - "Sufficient" means the gold passages were retrieved. No reader model checks the answer.
 - The original idea also had an LLM-judge stopping baseline and answer-stability as a feature.
   Neither is in the results. The stability features here measure how stable the *retrieved set* is,
-  not the answer. The LLM-judge code exists (`stopret/llm_judge.py`) and is tested against a mock
-  Ollama server, but I have not run it with a real model, so there is no number for it yet.
+  not the answer. The LLM-judge code exists (`stopret/llm_judge.py`, backends for Ollama and Groq)
+  and is tested against mock servers, but I have not run it with a real model, so there is no
+  number for it yet. See "LLM-judge baseline" below to run it.
 - Hyperparameters of the classifiers are fixed defaults, not tuned. Thresholds are swept and shown
   as curves; the CV predictions are out-of-fold, but I choose which thresholds to discuss after
   seeing the curves.
@@ -197,21 +198,51 @@ I would not claim the give-up rule works. It is a diagnosis with a partial fix.
 pip install -r requirements-dev.txt
 python -m stopret download      # about 43 MB from GitHub
 python -m stopret run           # trajectories, CV, transfer, ablation, figures (about 2 min)
-python -m pytest                # 15 tests
+python -m pytest                # 26 tests
 ```
 
 `python -m stopret report` redraws the figures and tables from `results/metrics.json` without
 recomputing. Results are deterministic: running everything again gave identical metrics.
 
-Optional LLM-judge baseline (needs [Ollama](https://ollama.com) running locally):
+## LLM-judge baseline (optional, not run yet)
+
+The comparison I wanted from the start: after every hop, ask an LLM "is this evidence enough to
+answer the question?" and stop at the first YES. It costs one LLM request per hop, which is exactly
+what the learned classifier avoids, so it is the natural thing to compare against. The judge sees
+the question and all passages retrieved so far, and must answer YES or NO. Questions that already
+stopped are not sent to the LLM again, so the request count is what a real deployment would pay.
+
+Two backends:
 
 ```bash
-python -m stopret judge --model llama3.2:3b --n 200
+# 1) a model on your own machine, through Ollama
+python -m stopret judge --backend ollama --model llama3.2:3b --n 100
+
+# 2) open-weight models hosted by Groq (OpenAI-compatible API)
+export GROQ_API_KEY=...        # create it in the Groq console; never commit it
+python -m stopret judge --backend groq --model <model id from the Groq console> --n 100
+
+python -m stopret report       # adds an "LLM-judge" table to results/results_tables.md
 ```
 
-This judges the first 200 HotpotQA questions after every hop and writes
-`results/llm_judge_<model>.json`, comparing the judge with the fixed and learned policies at
-the same cost on the same questions.
+Notes for the Groq backend:
+
+- Use an instruct model, not a reasoning model. Reasoning models start with a long `<think>`
+  block, the answer is capped at 8 tokens, and the code stops with an error instead of guessing.
+- Model ids change and old ones get deprecated; take the id from the Groq console's model list.
+- The free tier has per-minute request limits and daily token limits that differ by model. The
+  client waits 2 seconds between requests by default (`--min-interval`), retries rate-limit and
+  server errors using the `Retry-After` header, and stops with a clear message if the server asks
+  for a long wait. Every answer is cached in `results/llm_judge_cache_*.json`, so running the same
+  command again later resumes where it stopped.
+- Size: with 4 hops, one question can use up to about 4,400 prompt tokens in total (rough
+  estimate from character counts, 4 characters per token). 100 questions is at most about 440k
+  tokens and 400 requests, and usually less because the judge stops at the first YES.
+- Run it on the same `--n` for every model you compare, so the numbers are comparable.
+
+The output (`results/llm_judge_<backend>_<model>.json`) has the judge's average hops and recall on
+the first n HotpotQA questions, next to the fixed-hop baseline and the learned classifier at the
+same cost on the same questions, the oracle, and the number of requests sent.
 
 ## Layout
 
@@ -226,7 +257,7 @@ stopret/
   evaluation.py    cost/recall, convex hull, paired bootstrap
   experiments.py   every experiment in this README
   plots.py, report.py, cli.py
-  llm_judge.py     optional Ollama baseline
+  llm_judge.py     optional LLM-judge baseline (Ollama and Groq backends)
 scripts/hopeless_questions.py
 tests/
 results/           metrics.json, results_tables.md, figures, per-hop feature tables (CSV)
@@ -240,6 +271,6 @@ results/           metrics.json, results_tables.md, figures, per-hop feature tab
   page before redistributing the data. The raw files are not included in this repository.
 - BM25 follows the Okapi formulation as implemented in the `rank_bm25` package.
 
-##  License
+## License
 
 MIT
