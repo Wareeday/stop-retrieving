@@ -15,8 +15,9 @@ report:         # redraw figures and tables from results/metrics.json
 test:
 	python -m pytest -q
 
-judge:          # optional, needs a running Ollama server: make judge MODEL=llama3.2:3b
-	python -m stopret judge --model $(MODEL) --n 200
+BACKEND ?= ollama
+judge:          # optional: make judge BACKEND=gemini MODEL=<id>   (needs GROQ_API_KEY or GEMINI_API_KEY)
+	python -m stopret judge --backend $(BACKEND) --model $(MODEL) --n 100
 
 clean:
 	rm -rf results/*.png results/*.json results/results_tables.md .pytest_cache

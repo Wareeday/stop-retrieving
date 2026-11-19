@@ -1,4 +1,4 @@
-"""All experiments reported in the README. Run with `python -m stopret run`."""
+v"""All experiments reported in the README. Run with `python -m stopret run`."""
 from __future__ import annotations
 
 import json
@@ -12,7 +12,7 @@ from .data import DATASETS, load
 from .evaluation import (default_taus, fixed_points, frontier_auc, outcome,
                          paired_bootstrap_vs_fixed, recall_at_budget, sweep)
 from .features import FEATURE_GROUPS, FEATURE_NAMES, build_table
-from .llm_judge import OllamaJudge
+from .llm_judge import JudgeRefused, make_judge
 from .models import MODEL_KINDS, cross_val_predict, fit_predict
 from .policies import oracle_stops, stop_hops, stop_hops_giveup, to_matrix
 from .trajectory import IterativeRetriever, RetrievalConfig
@@ -195,10 +195,19 @@ def run_all(data_dir: str = "data/raw", out_dir: str = "results", rebuild: bool 
     return metrics
 
 
-def run_llm_judge(model: str, n_questions: int = 200, host: str = "http://localhost:11434",
-                  data_dir: str = "data/raw", out_dir: str = "results") -> dict:
+def run_llm_judge(backend: str, model: str, n_questions: int = 100, host: str | None = None,
+                  data_dir: str = "data/raw", out_dir: str = "results",
+                  min_interval: float | None = None, thinking: str | None = None) -> dict:
     """LLM-judge stopping on the first `n_questions` HotpotQA questions, compared with the fixed
-    and learned policies on exactly the same questions. Needs a running Ollama server."""
+    and learned policies on exactly the same questions.
+
+    The judge is asked after each hop and the policy stops at the first YES, so later hops are
+    never sent to the LLM for questions that already stopped (this is also what a deployed
+    system would pay). Answers are cached per (question, hop), so an interrupted run, e.g. one
+    that hit a free-tier daily limit, resumes where it stopped.
+
+    If a provider declines to answer a prompt (e.g. a safety block), that hop counts as NO and is
+    reported as a refusal. `thinking` only applies to the gemini backend."""
     out = Path(out_dir)
     cfg = RetrievalConfig()
     ds = load("hotpotqa", data_dir)
@@ -207,25 +216,47 @@ def run_llm_judge(model: str, n_questions: int = 200, host: str = "http://localh
     suff = to_matrix(table, "sufficient", cfg.max_hops).astype(bool)[:n_questions]
 
     safe_model = model.replace(":", "_").replace("/", "_")
-    judge = OllamaJudge(model, host, cache_path=out / f"llm_judge_cache_{safe_model}.json")
-    verdicts = np.zeros((len(suff), cfg.max_hops))
+    if thinking is not None and backend != "gemini":
+        raise ValueError("--thinking only applies to the gemini backend")
+    tag = f"{backend}_{safe_model}"
+    if thinking not in (None, "omit"):
+        tag += f"_think-{thinking}"
+    kwargs = {"cache_path": out / f"llm_judge_cache_{tag}.json"}
+    if min_interval is not None:
+        kwargs["min_interval"] = min_interval
+    if thinking is not None:
+        kwargs["thinking"] = thinking
+    judge = make_judge(backend, model, host, **kwargs)
+
+    stops = np.full(len(suff), cfg.max_hops)
     for qi, ex in enumerate(ds.examples[: len(suff)]):
         for hop in retriever.retrieve(ex):
             passages = [(ds.titles[i], ds.texts[i]) for i in hop.seen_ids]
-            verdicts[qi, hop.hop - 1] = judge.is_sufficient(ex.question, passages,
-                                                            cache_key=f"{ex.qid}|{hop.hop}")
+            try:
+                sufficient = judge.is_sufficient(ex.question, passages,
+                                                 cache_key=f"{ex.qid}|{hop.hop}")
+            except JudgeRefused:
+                sufficient = False
+            if sufficient:
+                stops[qi] = hop.hop
+                break
         if (qi + 1) % 20 == 0:
-            print(f"  judged {qi + 1}/{len(suff)} questions", flush=True)
+            print(f"  judged {qi + 1}/{len(suff)} questions ({judge.n_calls} requests sent)",
+                  flush=True)
 
-    cost, recall = outcome(suff, stop_hops(verdicts, 0.5))
+    cost, recall = outcome(suff, stops)
     learned = cross_val_predict(table, cfg.max_hops, "gbm").reshape(-1, cfg.max_hops)[: len(suff)]
     learned_points = sweep(learned, suff, default_taus())
     result = {
-        "model": model, "n_questions": len(suff),
+        "backend": backend, "model": model, "n_questions": len(suff),
         "llm_judge": {"cost": cost, "recall": recall},
         "fixed_hops_recall_at_same_cost": recall_at_budget(fixed_points(suff), cost),
         "learned_gbm_recall_at_same_cost": recall_at_budget(learned_points, cost),
         "oracle": dict(zip(("cost", "recall"), outcome(suff, oracle_stops(suff)))),
+        "thinking": thinking,
+        "refused_prompts_this_run": judge.n_refused,
+        "requests_sent_this_run": judge.n_calls,
+        "approx_prompt_tokens_this_run": judge.prompt_chars // 4,
     }
-    (out / f"llm_judge_{safe_model}.json").write_text(json.dumps(result, indent=1))
+    (out / f"llm_judge_{tag}.json").write_text(json.dumps(result, indent=1))
     return result

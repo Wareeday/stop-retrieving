@@ -183,7 +183,7 @@ I would not claim the give-up rule works. It is a diagnosis with a partial fix.
 - "Sufficient" means the gold passages were retrieved. No reader model checks the answer.
 - The original idea also had an LLM-judge stopping baseline and answer-stability as a feature.
   Neither is in the results. The stability features here measure how stable the *retrieved set* is,
-  not the answer. The LLM-judge code exists (`stopret/llm_judge.py`, backends for Ollama and Groq)
+  not the answer. The LLM-judge code exists (`stopret/llm_judge.py`, backends for Ollama, Groq and Gemini)
   and is tested against mock servers, but I have not run it with a real model, so there is no
   number for it yet. See "LLM-judge baseline" below to run it.
 - Hyperparameters of the classifiers are fixed defaults, not tuned. Thresholds are swept and shown
@@ -198,7 +198,7 @@ I would not claim the give-up rule works. It is a diagnosis with a partial fix.
 pip install -r requirements-dev.txt
 python -m stopret download      # about 43 MB from GitHub
 python -m stopret run           # trajectories, CV, transfer, ablation, figures (about 2 min)
-python -m pytest                # 26 tests
+python -m pytest                # 38 tests
 ```
 
 `python -m stopret report` redraws the figures and tables from `results/metrics.json` without
@@ -212,7 +212,7 @@ what the learned classifier avoids, so it is the natural thing to compare agains
 the question and all passages retrieved so far, and must answer YES or NO. Questions that already
 stopped are not sent to the LLM again, so the request count is what a real deployment would pay.
 
-Two backends:
+Three backends:
 
 ```bash
 # 1) a model on your own machine, through Ollama
@@ -222,23 +222,55 @@ python -m stopret judge --backend ollama --model llama3.2:3b --n 100
 export GROQ_API_KEY=...        # create it in the Groq console; never commit it
 python -m stopret judge --backend groq --model <model id from the Groq console> --n 100
 
+# 3) Gemini models through the Gemini API
+export GEMINI_API_KEY=...      # create it in Google AI Studio; GOOGLE_API_KEY also works
+python -m stopret judge --backend gemini --model <model id from AI Studio> --n 100 --thinking off
+
 python -m stopret report       # adds an "LLM-judge" table to results/results_tables.md
 ```
 
-Notes for the Groq backend:
+Run all three on the same `--n` if you want to compare them; each run writes its own result file
+and the report puts them in one table.
+
+Notes that apply to every backend:
+
+- Every answer is cached in `results/llm_judge_cache_*.json`, so running the same command again
+  resumes where it stopped (useful when a free-tier limit interrupts a run).
+- The client spaces requests (`--min-interval`), retries rate-limit and server errors using the
+  wait the server asks for, and stops with a clear message if the server asks for a long wait,
+  for example when a daily quota is used up.
+- Size: with 4 hops, one question can use up to about 4,400 prompt tokens in total (rough
+  estimate from character counts, 4 characters per token). 100 questions is at most about 440k
+  tokens and 400 requests, and usually less because the judge stops at the first YES.
+- Run it with the same `--n` for every model you compare, so the numbers are comparable. With
+  n = 100 the differences between models will come with wide uncertainty.
+
+Groq specifics:
 
 - Use an instruct model, not a reasoning model. Reasoning models start with a long `<think>`
   block, the answer is capped at 8 tokens, and the code stops with an error instead of guessing.
 - Model ids change and old ones get deprecated; take the id from the Groq console's model list.
-- The free tier has per-minute request limits and daily token limits that differ by model. The
-  client waits 2 seconds between requests by default (`--min-interval`), retries rate-limit and
-  server errors using the `Retry-After` header, and stops with a clear message if the server asks
-  for a long wait. Every answer is cached in `results/llm_judge_cache_*.json`, so running the same
-  command again later resumes where it stopped.
-- Size: with 4 hops, one question can use up to about 4,400 prompt tokens in total (rough
-  estimate from character counts, 4 characters per token). 100 questions is at most about 440k
-  tokens and 400 requests, and usually less because the judge stops at the first YES.
-- Run it on the same `--n` for every model you compare, so the numbers are comparable.
+- Default spacing is 2 seconds between requests. Free-tier limits differ by model.
+
+Gemini specifics:
+
+- The API key goes in the `x-goog-api-key` header and is never put in the URL or saved.
+- Take the model id from Google AI Studio. The free tier covers only some models, and preview
+  models are more restricted.
+- Rate limits are per project and per model, measured in requests per minute, tokens per minute
+  and requests per day (the daily quota resets at midnight Pacific time). The per-model numbers are
+  only shown in AI Studio's rate-limit page, so I did not hard-code any. The default spacing is a
+  conservative 6 seconds between requests (at most 10 per minute); lower it with `--min-interval`
+  if your limits allow.
+- Newer Gemini models think before answering, and the thinking tokens count against the output
+  limit. That is why the output limit is 1024 tokens here and why `--thinking` exists:
+  `omit` (default, sends no setting, works with every model but may spend tokens on thinking),
+  `off` (thinking budget 0, for models that let you switch thinking off), or `minimal`, `low`,
+  `medium`, `high` (thinking levels, for newer models). Which value a model accepts depends on the
+  model. If the API answers HTTP 400 about thinking, try another value or `omit`. If the answer
+  comes back empty with finish reason MAX_TOKENS, thinking used up the budget.
+- If Gemini declines to answer a prompt (for example a safety block), that hop counts as NO and
+  the number of such prompts is reported in the result file and the table.
 
 The output (`results/llm_judge_<backend>_<model>.json`) has the judge's average hops and recall on
 the first n HotpotQA questions, next to the fixed-hop baseline and the learned classifier at the
@@ -257,7 +289,7 @@ stopret/
   evaluation.py    cost/recall, convex hull, paired bootstrap
   experiments.py   every experiment in this README
   plots.py, report.py, cli.py
-  llm_judge.py     optional LLM-judge baseline (Ollama and Groq backends)
+  llm_judge.py     optional LLM-judge baseline (Ollama, Groq and Gemini backends)
 scripts/hopeless_questions.py
 tests/
 results/           metrics.json, results_tables.md, figures, per-hop feature tables (CSV)
@@ -272,5 +304,4 @@ results/           metrics.json, results_tables.md, figures, per-hop feature tab
 - BM25 follows the Okapi formulation as implemented in the `rank_bm25` package.
 
 ## License
-
 MIT

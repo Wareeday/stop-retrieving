@@ -1,6 +1,7 @@
 """Turn metrics.json into the markdown tables used in the README."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 POLICY_ROWS = [
@@ -116,4 +117,25 @@ def write_tables(metrics: dict, path: Path) -> None:
     for label, v in metrics["ablation_hotpotqa_gbm"].items():
         out.append(f"| {label} | {v['n_features']} | {v['auc']:.3f} | "
                    f"{_pct(v['frontier_auc'])} ± {100 * v['frontier_auc_std']:.1f} |")
+    judge_files = sorted(Path(path).parent.glob("llm_judge_*_*.json"))
+    judge_files = [f for f in judge_files if "cache" not in f.name]
+    if judge_files:
+        out.append("\n## LLM-judge stopping baseline (HotpotQA, same questions for every row)\n")
+        out.append("| Judge | questions | avg hops | recall % | fixed hops, same cost | "
+                   "learned (gbm), same cost | oracle | requests sent |")
+        out.append("|---|---:|---:|---:|---:|---:|---|---:|")
+        for f in judge_files:
+            r = json.loads(f.read_text())
+            think = r.get("thinking")
+            label = f"{r['backend']}: {r['model']}" + (f" (thinking={think})" if think not in (None, "omit") else "")
+            out.append(f"| {label} | {r['n_questions']} | "
+                       f"{r['llm_judge']['cost']:.2f} | {_pct(r['llm_judge']['recall'])} | "
+                       f"{_pct(r['fixed_hops_recall_at_same_cost'])} | "
+                       f"{_pct(r['learned_gbm_recall_at_same_cost'])} | "
+                       f"{_pct(r['oracle']['recall'])} at {r['oracle']['cost']:.2f} | "
+                       f"{r['requests_sent_this_run']} |")
+        refused = [f for f in judge_files if json.loads(f.read_text()).get("refused_prompts_this_run")]
+        if refused:
+            out.append("\nSome judge prompts were declined by the provider and counted as NO: "
+                       + ", ".join(f.stem for f in refused) + ".")
     Path(path).write_text("\n".join(out) + "\n")

@@ -3,3 +3,5 @@ __pycache__/
 .pytest_cache/
 *.pyc
 results/llm_judge_cache_*.json
+.env.env
+.env.local
