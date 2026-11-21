@@ -30,8 +30,10 @@ for my PhD applications, and this is a first, small, honest attempt at it.
 
 **Data.** The 1,000-question subsets of HotpotQA, 2WikiMultihopQA and MuSiQue that the HippoRAG
 authors released, each with its own pooled passage corpus (about 9.8k, 6.1k and 11.7k passages).
-`python -m stopret download` fetches them from
-[OSU-NLP-Group/HippoRAG](https://github.com/OSU-NLP-Group/HippoRAG/tree/main/reproduce/dataset).
+`python -m stopret download` fetches the six files (about 43 MB) from
+[OSU-NLP-Group/HippoRAG](https://github.com/OSU-NLP-Group/HippoRAG/tree/main/reproduce/dataset),
+pinned to one commit and checked against SHA-256 hashes, so the data behind the numbers cannot
+change silently and an interrupted download cannot leave a broken file behind.
 Searching a pooled corpus of this size is easier than searching all of Wikipedia, so absolute
 recall numbers here are not comparable with full-corpus results.
 
@@ -183,9 +185,9 @@ I would not claim the give-up rule works. It is a diagnosis with a partial fix.
 - "Sufficient" means the gold passages were retrieved. No reader model checks the answer.
 - The original idea also had an LLM-judge stopping baseline and answer-stability as a feature.
   Neither is in the results. The stability features here measure how stable the *retrieved set* is,
-  not the answer. The LLM-judge code exists (`stopret/llm_judge.py`, backends for Ollama, Groq and Gemini)
-  and is tested against mock servers, but I have not run it with a real model, so there is no
-  number for it yet. See "LLM-judge baseline" below to run it.
+  not the answer. The LLM-judge code exists (`stopret/llm_judge.py`; Ollama, free hosted open-model
+  APIs, any OpenAI-compatible server) and is tested against mock servers, but I have not run it
+  with a real model, so there is no number for it yet. See "LLM-judge baseline" below.
 - Hyperparameters of the classifiers are fixed defaults, not tuned. Thresholds are swept and shown
   as curves; the CV predictions are out-of-fold, but I choose which thresholds to discuss after
   seeing the curves.
@@ -194,15 +196,26 @@ I would not claim the give-up rule works. It is a diagnosis with a partial fix.
 
 ## Running it
 
+Python 3.10 or newer (developed and tested on 3.12).
+
 ```bash
 pip install -r requirements-dev.txt
-python -m stopret download      # about 43 MB from GitHub
-python -m stopret run           # trajectories, CV, transfer, ablation, figures (about 2 min)
-python -m pytest                # 38 tests
+python -m stopret download      # 6 files, about 43 MB, SHA-256 verified
+python -m stopret run           # trajectories, CV, transfer, ablation, figures (about 2 min, 1 CPU core)
+python -m pytest                # 71 tests (plain `pytest` works too)
 ```
 
 `python -m stopret report` redraws the figures and tables from `results/metrics.json` without
-recomputing. Results are deterministic: running everything again gave identical metrics.
+recomputing. Running `download` again later re-verifies the files.
+
+**Reproducibility.** The numbers in this README come from the exact library versions in
+`requirements-lock.txt`; running everything twice there gave identical metrics. I also ran the full
+test suite and the whole pipeline with the oldest versions that `requirements.txt` allows
+(numpy 1.26, scipy 1.11, pandas 2.1, scikit-learn 1.4, matplotlib 3.8). The retrieval trajectories
+and features come out identical (differences around 1e-15), logistic-regression results are
+identical, and gradient-boosting results move slightly because scikit-learn changed between
+versions: AUC by at most 0.1 points, recall at a given budget by at most 0.2 points, and the
+differences to the fixed-hop baseline in the tables by at most 0.3 points. No conclusion changes.
 
 ## LLM-judge baseline (optional, not run yet)
 
@@ -212,96 +225,183 @@ what the learned classifier avoids, so it is the natural thing to compare agains
 the question and all passages retrieved so far, and must answer YES or NO. Questions that already
 stopped are not sent to the LLM again, so the request count is what a real deployment would pay.
 
-Three backends:
+I could not run any of this where I built the project (no access to these APIs), so there is no
+number yet. What is tested, against mock servers, is everything around the model call: request
+format for each provider, answer parsing, retries, pacing, caching, error messages.
+
+### Step 1: see what it will cost before spending any quota
 
 ```bash
-# 1) a model on your own machine, through Ollama
-python -m stopret judge --backend ollama --model llama3.2:3b --n 100
-
-# 2) open-weight models hosted by Groq (OpenAI-compatible API)
-export GROQ_API_KEY=...        # create it in the Groq console; never commit it
-python -m stopret judge --backend groq --model <model id from the Groq console> --n 100
-
-# 3) Gemini models through the Gemini API
-export GEMINI_API_KEY=...      # create it in Google AI Studio; GOOGLE_API_KEY also works
-python -m stopret judge --backend gemini --model <model id from AI Studio> --n 100 --thinking off
-
-python -m stopret report       # adds an "LLM-judge" table to results/results_tables.md
+python -m stopret judge --dry-run --n 100 --tokens-per-minute 8000 --tpd 200000 --rpm 30 --rpd 1000
 ```
 
-Run all three on the same `--n` if you want to compare them; each run writes its own result file
-and the report puts them in one table.
+No API call is made. Put in the limits from your own provider console. For the first 100 HotpotQA
+questions the worst case (the judge says NO after every hop, so all hops are sent) is:
 
-Notes that apply to every backend:
+| | |
+|---|---|
+| requests | 400 |
+| prompt tokens (estimate, 4 characters per token) | about 430,000 (plus up to `--max-tokens` per reply) |
+| prompt size by hop | about 420, 840, 1,310 and 1,750 tokens |
+| with Groq's sample free limits (8k tokens/min, 200k tokens/day) | at least 54 minutes, and about 2.2 days |
 
-- Every answer is cached in `results/llm_judge_cache_*.json`, so running the same command again
-  resumes where it stopped (useful when a free-tier limit interrupts a run).
-- The client spaces requests (`--min-interval`), retries rate-limit and server errors using the
-  wait the server asks for, and stops with a clear message if the server asks for a long wait,
-  for example when a daily quota is used up.
-- Size: with 4 hops, one question can use up to about 4,400 prompt tokens in total (rough
-  estimate from character counts, 4 characters per token). 100 questions is at most about 440k
-  tokens and 400 requests, and usually less because the judge stops at the first YES.
-- Run it with the same `--n` for every model you compare, so the numbers are comparable. With
-  n = 100 the differences between models will come with wide uncertainty.
+In practice usage is lower because the judge stops at its first YES. The point is that on free
+tiers the limit that hurts is usually *tokens per minute and per day*, not requests per minute.
 
-Groq specifics:
+### Step 2: pick a provider
 
-- Use an instruct model, not a reasoning model. Reasoning models start with a long `<think>`
-  block, the answer is capped at 8 tokens, and the code stops with an error instead of guessing.
-- Model ids change and old ones get deprecated; take the id from the Groq console's model list.
-- Default spacing is 2 seconds between requests. Free-tier limits differ by model.
+All of these host open-weight models behind an OpenAI-compatible API. Limits below are what I could
+read from the providers' own documentation and from third-party trackers in autumn 2026. Free tiers
+change often, so treat the numbers as a starting point and check your console (and your own
+`--dry-run`).
 
-Gemini specifics:
+| Provider (`--backend`) | Free-tier limits as published | What it means for n = 100 |
+|---|---|---|
+| `mistral` | Mistral's help centre: 1 request/second, 500,000 tokens/minute, 1 billion tokens/month | the only one where it finishes in minutes (400 requests at 1 per second is about 7 minutes) |
+| `cerebras` | about 1 million tokens/day reported by several sources; sources disagree on the requests-per-minute limit (5 vs 30) and on whether a card is needed | fits in a day if the daily limit holds; very fast responses |
+| `groq` | docs list sample free limits of 30 requests/min, 1,000 requests/day, 8,000 tokens/min, 200,000 tokens/day for gpt-oss and a Qwen model | fastest responses, but the token limits mean roughly 40 questions per day; n = 100 takes about 3 days (the cache lets you resume) |
+| `openrouter` | free models (ids ending in `:free`); community lists report about 20 requests/min and 200 requests/day | about 50 questions per day |
+| `ollama` | none (runs on your machine) | no quota, but slow on a CPU; fine for a 20-question smoke test |
 
-- The API key goes in the `x-goog-api-key` header and is never put in the URL or saved.
-- Take the model id from Google AI Studio. The free tier covers only some models, and preview
-  models are more restricted.
-- Rate limits are per project and per model, measured in requests per minute, tokens per minute
-  and requests per day (the daily quota resets at midnight Pacific time). The per-model numbers are
-  only shown in AI Studio's rate-limit page, so I did not hard-code any. The default spacing is a
-  conservative 6 seconds between requests (at most 10 per minute); lower it with `--min-interval`
-  if your limits allow.
-- Newer Gemini models think before answering, and the thinking tokens count against the output
-  limit. That is why the output limit is 1024 tokens here and why `--thinking` exists:
-  `omit` (default, sends no setting, works with every model but may spend tokens on thinking),
-  `off` (thinking budget 0, for models that let you switch thinking off), or `minimal`, `low`,
-  `medium`, `high` (thinking levels, for newer models). Which value a model accepts depends on the
-  model. If the API answers HTTP 400 about thinking, try another value or `omit`. If the answer
-  comes back empty with finish reason MAX_TOKENS, thinking used up the budget.
-- If Gemini declines to answer a prompt (for example a safety block), that hop counts as NO and
-  the number of such prompts is reported in the result file and the table.
+**My ranking for this workload is based only on those published limits, not on running anything:**
+Mistral first (largest quota, provided there is a model with open weights on the free tier that
+you like), then Cerebras, then Groq, then OpenRouter. Groq is not slower per request. It simply runs
+out of tokens first. Whatever you choose, run `--n 20` first to check that answers parse and the
+numbers look sane, then the full run.
+
+**Which model.** The judge has to read 3 to 12 short passages and decide whether they are enough.
+I would expect large instruct models (gpt-oss-120b class and up) to be more reliable than 8B-class
+ones, and I would run one small and one large model on the same `--n` to show how much the baseline
+depends on the model. I have not measured this. Use the exact model id shown in the provider's
+console; ids change and old ones are retired.
+
+### Step 3: run it
+
+```bash
+export MISTRAL_API_KEY=...            # keys come from each provider's console; never commit them
+python -m stopret judge --backend mistral --model <open-weight model id> --n 100 \
+    --rpm 50 --tokens-per-minute 400000
+
+# gpt-oss models are reasoning models: lower the effort and leave room for the answer
+export CEREBRAS_API_KEY=...
+python -m stopret judge --backend cerebras --model gpt-oss-120b --n 100 \
+    --extra-body '{"reasoning_effort": "low"}' --max-tokens 512 --rpm 30
+
+export GROQ_API_KEY=...
+python -m stopret judge --backend groq --model openai/gpt-oss-120b --n 40 \
+    --extra-body '{"reasoning_effort": "low"}' --max-tokens 512 --rpm 30 --tokens-per-minute 8000
+
+export OPENROUTER_API_KEY=...         # OpenRouter takes the reasoning option in a different shape
+python -m stopret judge --backend openrouter --model <model id>:free --n 50 \
+    --extra-body '{"reasoning": {"effort": "low"}}' --max-tokens 512 --rpm 20
+
+# any other OpenAI-compatible server
+python -m stopret judge --backend openai-compatible --host https://example.com/v1 \
+    --api-key-env MY_KEY --model <id>
+
+# a model on your own machine
+python -m stopret judge --backend ollama --model llama3.2:3b --n 20
+
+python -m stopret report              # adds an "LLM-judge" table to results/results_tables.md
+```
+
+| Option | What it does |
+|---|---|
+| `--n` | first n HotpotQA questions. Use the same n for every model you compare |
+| `--rpm`, `--min-interval` | spacing between requests (`--rpm 30` means one every 2 seconds) |
+| `--tokens-per-minute` | paces requests so the *estimated* tokens in any 60 seconds stay under your limit |
+| `--max-tokens` | output limit (default 16). Reasoning models need more, for example 512 |
+| `--extra-body` | JSON merged into the request, for provider-specific options such as the reasoning effort |
+| `--host`, `--api-key-env` | server URL and the name of the key's environment variable (generic backend) |
+| `--dry-run`, `--tpd`, `--rpd` | estimate only, see Step 1 |
+
+What the client does for you: it retries 429 and 5xx answers using the wait the server states, and
+stops with a clear message (instead of sleeping for hours) when the server asks for a long wait,
+for example when a daily limit is used up. Every answer is cached on disk under a hash of the full
+prompt and all settings, so running the same command again, tomorrow if need be, resumes where it
+stopped and never reuses an answer given under different settings. If the model returns an empty
+answer because a reasoning model spent its whole output budget thinking, the run stops with advice
+on how to fix it instead of counting it as NO. If a provider refuses a prompt (for example a content
+filter), that hop counts as NO and the refusals are reported.
 
 The output (`results/llm_judge_<backend>_<model>.json`) has the judge's average hops and recall on
-the first n HotpotQA questions, next to the fixed-hop baseline and the learned classifier at the
-same cost on the same questions, the oracle, and the number of requests sent.
+the first n HotpotQA questions, the difference to the fixed-hop baseline at the same cost with a
+bootstrap interval, the learned classifier at the same cost on the same questions, the oracle, and
+how many requests were sent. With n = 100 the intervals will be wide.
+
+**Gemini** (`--backend gemini`, key in `GEMINI_API_KEY`) is also supported, including a `--thinking`
+setting for models that think by default. Gemini models are proprietary, so this backend is not part
+of the open-source setup; I kept it as an optional extra.
+
+### If something goes wrong
+
+| What you see | What it means and what to do |
+|---|---|
+| `stopped: ... Progress is cached; run the same command again later` | a rate limit was hit (often the daily token limit). Nothing is lost: run the same command later and it resumes from the cache |
+| `error: set the ..._API_KEY environment variable` | the key is not set in this terminal; `export` it again (a new terminal does not inherit it) |
+| `HTTP 401` | wrong or expired key |
+| `HTTP 400` or `404` mentioning the model | the model id is wrong or retired; copy it from the provider's console. A 400 about an option usually means `--extra-body` or `--thinking` does not suit that model |
+| `the model returned an empty answer ... only reasoning` | a reasoning model used its whole output budget on thinking: raise `--max-tokens` (for example 512) and lower the effort with `--extra-body` |
+| a run is slower than expected | pacing is working as intended: lower `--rpm` / `--tokens-per-minute` only if your limits allow it, or use a provider with a larger quota |
+| `SHA-256 mismatch` or `verification failed` | a dataset file is corrupt or the source changed; run `python -m stopret download --force` |
+| `FileNotFoundError ... python -m stopret download` | the data has not been downloaded yet |
+
+## Open-source stack and licences
+
+Everything needed to reproduce the main results is open source or openly licensed, and none of it
+needs an API key. The LLM-judge baseline is the only part that calls a model.
+
+| Part | What | Licence |
+|---|---|---|
+| This code | the `stopret` package, tests, scripts | MIT (see `LICENSE`; change it if you prefer another) |
+| Libraries | numpy, scipy, pandas, scikit-learn | BSD-3-Clause |
+| | matplotlib | Matplotlib licence (BSD-style, PSF-based) |
+| | pytest (tests), rank_bm25 (tests only) | MIT, Apache-2.0 |
+| Retriever | BM25, implemented in this repository | no model or API needed |
+| Data | HotpotQA | CC BY-SA 4.0 for the data (its README) |
+| | 2WikiMultihopQA | the repository's licence file is Apache-2.0; check the dataset terms |
+| | MuSiQue | CC BY 4.0 (its README) |
+| | the 1,000-question subsets | taken from the HippoRAG repository (MIT) |
+| LLM judge (optional) | open-weight models on free hosted APIs, or Ollama | depends on the model, see below |
+
+The raw data is downloaded, not stored in this repository. The CSVs in `results/` contain only
+numeric features and question ids.
+
+"Open weights" is not the same as an open-source licence. For the optional judge: the gpt-oss
+models are released under Apache 2.0 (check the model card of the exact model you use), Llama
+models come under Meta's own community licence, which is not an OSI open-source licence, and Gemini
+has no downloadable weights at all. If you want to say the whole project is open source, pick a
+model with an Apache-2.0 or similar licence, and remember that a hosted free tier still has its own
+terms of service.
 
 ## Layout
 
 ```
 stopret/
-  data.py          load the three datasets, map gold passages to corpus ids
+  data.py          dataset download (pinned commit, SHA-256 checks), loading, gold-passage mapping
   bm25.py          sparse BM25
   trajectory.py    iterative retrieval, one result per hop
   features.py      the 20 features and the labels
   models.py        logistic regression / gradient boosting, question-grouped CV
   policies.py      stopping rules (fixed, threshold, give-up, oracle)
   evaluation.py    cost/recall, convex hull, paired bootstrap
-  experiments.py   every experiment in this README
+  experiments.py   every experiment in this README, the LLM-judge runner and the dry-run estimate
   plots.py, report.py, cli.py
-  llm_judge.py     optional LLM-judge baseline (Ollama, Groq and Gemini backends)
+  llm_judge.py     optional LLM-judge baseline: Ollama, free hosted APIs, generic OpenAI-compatible
+                   servers, Gemini; pacing, retries, cache
 scripts/hopeless_questions.py
-tests/
+tests/             71 tests (BM25 vs rank_bm25, pipeline invariants, data integrity, mock-server tests)
 results/           metrics.json, results_tables.md, figures, per-hop feature tables (CSV)
+requirements.txt, requirements-dev.txt, requirements-lock.txt, pytest.ini, Makefile, LICENSE
 ```
 
 ## Sources
 
 - HotpotQA: Yang et al., 2018. 2WikiMultihopQA: Ho et al., 2020. MuSiQue: Trivedi et al., 2022.
 - The 1,000-question subsets and pooled corpora come from the HippoRAG repository
-  (Gutierrez et al., 2024). The datasets keep their original licences; check each dataset's
-  page before redistributing the data. The raw files are not included in this repository.
+  (Gutierrez et al., 2024), pinned to commit `d5c8329`. The datasets keep their original licences
+  (see the table above). The raw files are not included in this repository.
 - BM25 follows the Okapi formulation as implemented in the `rank_bm25` package.
-
-## License
-MIT
+- Provider limits in the LLM-judge section: Groq's rate-limit documentation, Mistral's help centre,
+  Cerebras documentation and third-party trackers, read in autumn 2026. They change; check your
+  own console.

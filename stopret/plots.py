@@ -20,7 +20,7 @@ LABELS = {"fixed": "fixed number of hops", "coverage": "stop on question coverag
 
 def _line(ax, points, key, style="-", label=None, marker=None):
     hull = upper_hull(points)
-    xs, ys = zip(*hull)
+    xs, ys = zip(*hull, strict=True)
     ax.plot(xs, ys, style, color=COLORS[key], label=label or LABELS[key], marker=marker,
             linewidth=2, markersize=6)
 
@@ -50,7 +50,7 @@ def plot_hotpotqa(res: dict, path: Path) -> None:
 def plot_all_datasets(metrics: dict, path: Path) -> None:
     names = list(metrics["datasets"])
     fig, axes = plt.subplots(1, len(names), figsize=(5.0 * len(names), 4.2), sharey=False)
-    for ax, name in zip(axes, names):
+    for ax, name in zip(axes, names, strict=True):
         res = metrics["datasets"][name]
         _line(ax, res["fixed"]["points"], "fixed", marker="o")
         gu = res["in_domain_cv"]["gbm"]["giveup"]

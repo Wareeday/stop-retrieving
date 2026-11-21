@@ -1,9 +1,9 @@
-.PHONY: install data run report test judge clean
+.PHONY: install data run report test lint estimate judge clean
 
 install:
 	pip install -r requirements-dev.txt
 
-data:
+data:           # downloads the 6 dataset files and verifies their SHA-256 hashes
 	python -m stopret download
 
 run:            # builds trajectories, runs every experiment, writes results/ (about 2 minutes)
@@ -15,9 +15,14 @@ report:         # redraw figures and tables from results/metrics.json
 test:
 	python -m pytest -q
 
-BACKEND ?= ollama
-judge:          # optional: make judge BACKEND=gemini MODEL=<id>   (needs GROQ_API_KEY or GEMINI_API_KEY)
-	python -m stopret judge --backend $(BACKEND) --model $(MODEL) --n 100
+lint:
+	ruff check .
+
+estimate:       # no API calls: make estimate N=100 LIMITS="--tokens-per-minute 8000 --tpd 200000"
+	python -m stopret judge --dry-run --n $(or $(N),100) $(LIMITS)
+
+judge:          # make judge BACKEND=cerebras MODEL=<id> N=100 OPTS='--rpm 30 --extra-body ...'
+	python -m stopret judge --backend $(BACKEND) --model $(MODEL) --n $(or $(N),100) $(OPTS)
 
 clean:
-	rm -rf results/*.png results/*.json results/results_tables.md .pytest_cache
+	rm -rf results/*.png results/metrics.json results/results_tables.md .pytest_cache

@@ -75,3 +75,9 @@ def test_features_never_depend_on_gold(tiny_dataset):
 
 def test_normalize_title_strips_disambiguation():
     assert normalize_title("Chris Evans (actor)") == "chris evans"
+
+
+def test_retrieval_config_rejects_unusable_values():
+    for bad in ({"k": 1}, {"max_hops": 0}, {"question_weight": 0}):
+        with pytest.raises(ValueError):
+            RetrievalConfig(**bad)

@@ -148,7 +148,7 @@ def build_table(retriever: IterativeRetriever) -> pd.DataFrame:
     for ex in retriever.ds.examples:
         hops = retriever.retrieve(ex)
         gold = set(ex.gold_ids)
-        for h, feats in zip(hops, extractor.hop_features(ex, hops)):
+        for h, feats in zip(hops, extractor.hop_features(ex, hops), strict=True):
             found = len(gold & set(h.seen_ids))
             records.append({
                 "qid": ex.qid,

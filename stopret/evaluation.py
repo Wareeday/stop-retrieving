@@ -56,7 +56,7 @@ def recall_at_budget(points: list[tuple[float, float]], budget: float) -> float:
     """Best recall reachable with at most `budget` average hops (nan if even the cheapest
     point costs more)."""
     hull = upper_hull(points)
-    xs, ys = zip(*hull)
+    xs, ys = zip(*hull, strict=True)
     if budget < xs[0] - 1e-12:
         return float("nan")
     if budget >= xs[-1]:

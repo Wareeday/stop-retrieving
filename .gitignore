@@ -5,3 +5,4 @@ __pycache__/
 results/llm_judge_cache_*.json
 .env.env
 .env.local
+.env

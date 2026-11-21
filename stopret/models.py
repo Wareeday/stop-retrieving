@@ -20,23 +20,24 @@ def make_model(kind: str, seed: int = 0):
     if kind == "gbm":
         return HistGradientBoostingClassifier(
             max_depth=3, learning_rate=0.05, max_iter=150, l2_regularization=1.0,
-            min_samples_leaf=20, random_state=seed,
+            min_samples_leaf=20, early_stopping=False, random_state=seed,
         )
     raise ValueError(f"unknown model kind {kind!r}, expected one of {MODEL_KINDS}")
 
 
 def fit_predict(train: pd.DataFrame, test: pd.DataFrame, kind: str,
-                features: list[str] = FEATURE_NAMES, seed: int = 0,
+                features: list[str] | None = None, seed: int = 0,
                 target: str = "sufficient") -> np.ndarray:
     """target is 'sufficient' (is the evidence enough right now?) or 'eventually' (will it be
     enough by the last hop?)."""
+    features = FEATURE_NAMES if features is None else features
     model = make_model(kind, seed)
     model.fit(train[features], train[target])
     return model.predict_proba(test[features])[:, 1]
 
 
 def cross_val_predict(table: pd.DataFrame, max_hops: int, kind: str,
-                      features: list[str] = FEATURE_NAMES, n_splits: int = 5,
+                      features: list[str] | None = None, n_splits: int = 5,
                       seed: int = 0, target: str = "sufficient") -> np.ndarray:
     """Out-of-fold probabilities. Folds split by question, so no question appears in both
     the training and the test side, and every hop of a question stays together."""

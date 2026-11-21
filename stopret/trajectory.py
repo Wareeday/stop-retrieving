@@ -29,6 +29,15 @@ class RetrievalConfig:
     max_hops: int = 4
     question_weight: int = 3   # how many times the question tokens are repeated in the query
 
+    def __post_init__(self) -> None:
+        # the features use the best and the second-best new passage of every hop
+        if self.k < 2:
+            raise ValueError(f"k must be at least 2, got {self.k}")
+        if self.max_hops < 1:
+            raise ValueError(f"max_hops must be at least 1, got {self.max_hops}")
+        if self.question_weight < 1:
+            raise ValueError(f"question_weight must be at least 1, got {self.question_weight}")
+
 
 @dataclass
 class HopResult:
@@ -47,7 +56,7 @@ class IterativeRetriever:
     def __init__(self, ds: Dataset, cfg: RetrievalConfig = RetrievalConfig()):
         self.ds = ds
         self.cfg = cfg
-        self.doc_tokens = [tokenize(f"{t} {x}") for t, x in zip(ds.titles, ds.texts)]
+        self.doc_tokens = [tokenize(f"{t} {x}") for t, x in zip(ds.titles, ds.texts, strict=True)]
         self.bm25 = BM25(self.doc_tokens)
 
     def retrieve(self, example: Example) -> list[HopResult]:

@@ -1,27 +1,38 @@
 """Optional baseline: ask an LLM whether the retrieved evidence is sufficient.
 
 The policy is the obvious one: after each hop, show the question and everything retrieved so
-far to the model, and stop at the first "YES". Three backends are available:
+far to the model, and stop at the first "YES".
 
-    ollama   a model running on your own machine (http://localhost:11434)
-    groq     open-weight models hosted by Groq, through its OpenAI-compatible API
-             (needs the environment variable GROQ_API_KEY)
-    gemini   Google's Gemini models through the Gemini API (generateContent)
-             (needs the environment variable GEMINI_API_KEY, or GOOGLE_API_KEY)
+Backends
+--------
+ollama             a model on your own machine (http://localhost:11434). Free, but slow on a CPU.
+groq, cerebras,    hosted open-weight models behind an OpenAI-compatible API with a free tier.
+mistral,           The API key comes from an environment variable (GROQ_API_KEY, CEREBRAS_API_KEY,
+openrouter         MISTRAL_API_KEY, OPENROUTER_API_KEY).
+openai-compatible  any other OpenAI-compatible server: pass --host (base URL) and --api-key-env.
+gemini             Google's Gemini API. These are proprietary models, so this backend is not part
+                   of a fully open-source setup. It is kept as an optional extra.
 
-NOTE: I built this project in a sandbox with no Ollama, no GPU and no access to the Groq or
-Gemini APIs, so the plumbing (request format, answer parsing, retries, caching, rate-limit
-handling) is covered by tests against mock servers (tests/test_llm_judge.py), but no number for
-this baseline has been produced yet. Run `python -m stopret judge ...` to get one.
+Free tiers are limited by tokens per minute and tokens per day as much as by requests, so the
+client paces itself by tokens too (`tokens_per_minute`), retries 429/5xx answers using the wait
+the server states, and caches every answer so an interrupted run resumes where it stopped.
+
+NOTE: I built this project in a sandbox with no access to any of these APIs, so the plumbing
+(request format, answer parsing, retries, pacing, caching) is covered by tests against mock
+servers (tests/test_llm_judge.py). No number for this baseline has been produced yet.
+Run `python -m stopret judge ...` to get one.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import re
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 PROMPT = """You are checking retrieved evidence for a multi-hop question.
@@ -34,9 +45,30 @@ Retrieved passages:
 Do these passages together contain all the information needed to answer the question?
 Answer with exactly one word: YES or NO."""
 
-GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+CHARS_PER_TOKEN = 4          # rough English average, used for estimates only
+PACING_SAFETY = 1.2          # pace as if prompts were 20% longer than the estimate
+
+
+@dataclass(frozen=True)
+class Provider:
+    base_url: str
+    key_env: str
+    note: str
+
+
+PROVIDERS: dict[str, Provider] = {
+    "groq": Provider("https://api.groq.com/openai/v1", "GROQ_API_KEY",
+                     "very fast, but small free token budgets per minute and per day"),
+    "cerebras": Provider("https://api.cerebras.ai/v1", "CEREBRAS_API_KEY",
+                         "very fast, larger free daily token budget (check the current terms)"),
+    "mistral": Provider("https://api.mistral.ai/v1", "MISTRAL_API_KEY",
+                        "large free token budget, 1 request per second; use a model whose weights "
+                        "are open (check the model card)"),
+    "openrouter": Provider("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY",
+                           "many ':free' open models, but small daily request limits"),
+}
+BACKENDS = ("ollama", *PROVIDERS, "openai-compatible", "gemini")
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-BACKENDS = ("ollama", "groq", "gemini")
 THINKING_CHOICES = ("omit", "off", "minimal", "low", "medium", "high")
 
 
@@ -48,6 +80,17 @@ class RateLimitExhausted(RuntimeError):
 class JudgeRefused(ValueError):
     """The provider declined to answer this particular prompt (e.g. a safety block)."""
 
+
+def estimate_tokens(text: str) -> int:
+    return math.ceil(len(text) / CHARS_PER_TOKEN)
+
+
+def build_prompt(question: str, passages: list[tuple[str, str]]) -> str:
+    text = "\n".join(f"[{i}] {title}: {body}" for i, (title, body) in enumerate(passages, 1))
+    return PROMPT.format(question=question, passages=text)
+
+
+# ---------------------------------------------------------------- HTTP with retries
 
 def _retry_delay_from_body(raw: bytes) -> float | None:
     """Google-style 429 bodies carry the wait in error.details[].retryDelay, e.g. '34s'."""
@@ -103,34 +146,89 @@ def _post_json(url: str, payload: dict, headers: dict, timeout: float, max_retri
     raise AssertionError("unreachable")
 
 
+# ---------------------------------------------------------------- pacing
+
+class RateLimiter:
+    """Keeps requests at least `min_interval` seconds apart and, if `tokens_per_minute` is set,
+    keeps the (estimated) tokens sent in any rolling 60 seconds under that limit."""
+
+    def __init__(self, min_interval: float = 0.0, tokens_per_minute: int | None = None,
+                 clock=time.monotonic, sleep=time.sleep):
+        self.min_interval, self.tpm = min_interval, tokens_per_minute
+        self._clock, self._sleep = clock, sleep
+        self._last_start = float("-inf")
+        self._events: list[tuple[float, int]] = []
+
+    def wait(self, tokens: int) -> None:
+        while True:
+            now = self._clock()
+            self._events = [(t, n) for t, n in self._events if now - t < 60.0]
+            delay = max(0.0, self.min_interval - (now - self._last_start))
+            # A single request bigger than the whole budget could never fit, so only wait for
+            # the window to clear when something is actually in it.
+            if (self.tpm is not None and self._events
+                    and sum(n for _, n in self._events) + tokens > self.tpm):
+                delay = max(delay, self._events[0][0] + 60.0 - now)
+            if delay <= 1e-9:
+                break
+            self._sleep(delay)
+        self._last_start = self._clock()
+        self._events.append((self._last_start, tokens))
+
+
+# ---------------------------------------------------------------- judges
+
 class LLMJudge:
-    """Shared logic: prompt, answer parsing, caching, call counting, minimum request spacing."""
+    """Shared logic: prompt, answer parsing, pacing, call counting, and a disk cache keyed by a
+    hash of everything that affects the answer (backend, model, settings, full prompt)."""
 
     backend = "base"
 
     def __init__(self, model: str, cache_path: str | Path | None = None,
-                 min_interval: float = 0.0, timeout: float = 300.0, max_tokens: int = 8,
+                 min_interval: float = 0.0, tokens_per_minute: int | None = None,
+                 timeout: float = 300.0, max_tokens: int = 16, clock=time.monotonic,
                  sleep=time.sleep):
         self.model, self.timeout, self.max_tokens = model, timeout, max_tokens
-        self.min_interval, self._sleep = min_interval, sleep
-        self._last_request = float("-inf")
+        self._sleep = sleep
+        self.limiter = RateLimiter(min_interval, tokens_per_minute, clock, sleep)
         self.n_calls = 0              # requests actually sent (cache hits are not counted)
+        self.n_cache_hits = 0
         self.n_refused = 0            # prompts the provider declined to answer
         self.prompt_chars = 0         # characters sent, for a rough token estimate
         self.cache_path = Path(cache_path) if cache_path else None
-        self.cache: dict[str, bool] = {}
-        if self.cache_path and self.cache_path.exists():
-            self.cache = json.loads(self.cache_path.read_text())
+        self.cache: dict[str, bool] = self._load_cache()
 
+    # --- to be provided by subclasses
     def _complete(self, prompt: str) -> str:
         raise NotImplementedError
 
-    def _throttle(self) -> None:
-        wait = self.min_interval - (time.monotonic() - self._last_request)
-        if wait > 0:
-            self._sleep(wait)
-        self._last_request = time.monotonic()
+    def settings(self) -> dict:
+        """Everything besides the prompt that can change the answer (part of the cache key)."""
+        return {"backend": self.backend, "model": self.model, "max_tokens": self.max_tokens}
 
+    # --- cache
+    def _load_cache(self) -> dict[str, bool]:
+        if not self.cache_path or not self.cache_path.exists():
+            return {}
+        try:
+            return json.loads(self.cache_path.read_text())
+        except ValueError:
+            broken = self.cache_path.with_suffix(".corrupt")
+            self.cache_path.replace(broken)
+            print(f"warning: cache {self.cache_path} was unreadable, moved to {broken}")
+            return {}
+
+    def _save_cache(self) -> None:
+        if self.cache_path:
+            tmp = self.cache_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.cache))
+            os.replace(tmp, self.cache_path)       # atomic: Ctrl-C can't leave half a file
+
+    def cache_key(self, prompt: str) -> str:
+        blob = json.dumps(self.settings(), sort_keys=True) + "\n" + prompt
+        return hashlib.sha256(blob.encode()).hexdigest()[:32]
+
+    # --- answer parsing
     @staticmethod
     def parse(answer: str) -> bool:
         """YES/NO from the model's reply. Reasoning models may emit <think>...</think> first."""
@@ -145,26 +243,22 @@ class LLMJudge:
                 "or raise max_tokens")
         return cleaned.upper().startswith("YES")
 
-    def is_sufficient(self, question: str, passages: list[tuple[str, str]],
-                      cache_key: str | None = None) -> bool:
-        if cache_key is not None and cache_key in self.cache:
-            return self.cache[cache_key]
-        text = "\n".join(f"[{i}] {title}: {body}" for i, (title, body) in enumerate(passages, 1))
-        prompt = PROMPT.format(question=question, passages=text)
-        self._throttle()
+    def is_sufficient(self, question: str, passages: list[tuple[str, str]]) -> bool:
+        prompt = build_prompt(question, passages)
+        key = self.cache_key(prompt)
+        if key in self.cache:
+            self.n_cache_hits += 1
+            return self.cache[key]
+        self.limiter.wait(int(estimate_tokens(prompt) * PACING_SAFETY) + self.max_tokens)
+        self.n_calls += 1
+        self.prompt_chars += len(prompt)
         try:
             verdict = self.parse(self._complete(prompt))
         except JudgeRefused:
             self.n_refused += 1
-            self.n_calls += 1
-            self.prompt_chars += len(prompt)
             raise
-        self.n_calls += 1
-        self.prompt_chars += len(prompt)
-        if cache_key is not None:
-            self.cache[cache_key] = verdict
-            if self.cache_path:
-                self.cache_path.write_text(json.dumps(self.cache))
+        self.cache[key] = verdict
+        self._save_cache()
         return verdict
 
 
@@ -184,38 +278,71 @@ class OllamaJudge(LLMJudge):
         return reply["response"]
 
 
-class GroqJudge(LLMJudge):
-    """Groq's chat-completions endpoint (OpenAI-compatible). The key is read from the
-    GROQ_API_KEY environment variable and is never written to disk or to the results."""
+class OpenAICompatibleJudge(LLMJudge):
+    """Any server that speaks POST {base_url}/chat/completions (Groq, Cerebras, Mistral,
+    OpenRouter, vLLM, ...). The key is read from an environment variable and is never written to
+    disk or to the results.
 
-    backend = "groq"
+    `extra_body` is merged into the request for provider-specific options, for example
+    {"reasoning_effort": "low"} for gpt-oss models on Groq or Cerebras, or
+    {"reasoning": {"effort": "low"}} on OpenRouter."""
 
-    def __init__(self, model: str, base_url: str = GROQ_BASE_URL, api_key: str | None = None,
-                 min_interval: float = 2.0, **kwargs):
+    def __init__(self, model: str, provider: str | None = None, base_url: str | None = None,
+                 api_key: str | None = None, api_key_env: str | None = None,
+                 extra_body: dict | None = None, min_interval: float = 2.0, **kwargs):
         super().__init__(model, min_interval=min_interval, **kwargs)
+        preset = PROVIDERS.get(provider) if provider else None
+        self.backend = provider or "openai-compatible"
+        base_url = base_url or (preset.base_url if preset else None)
+        if not base_url:
+            raise ValueError("an OpenAI-compatible backend needs a base URL (--host)")
         self.base_url = base_url.rstrip("/")
-        self.api_key = api_key or os.environ.get("GROQ_API_KEY")
+        key_env = api_key_env or (preset.key_env if preset else None)
+        self.api_key = api_key or (os.environ.get(key_env) if key_env else None)
         if not self.api_key:
-            raise RuntimeError("set the GROQ_API_KEY environment variable "
-                               "(create a key in the Groq console)")
+            raise RuntimeError(
+                f"set the {key_env or 'API key'} environment variable"
+                + ("" if key_env else " and pass its name with --api-key-env"))
+        self.extra_body = dict(extra_body or {})
+        for reserved in ("model", "messages"):
+            if reserved in self.extra_body:
+                raise ValueError(f"extra_body may not set {reserved!r}")
+
+    def settings(self) -> dict:
+        return {**super().settings(), "base_url": self.base_url, "extra_body": self.extra_body}
 
     def _complete(self, prompt: str) -> str:
         reply = _post_json(
             f"{self.base_url}/chat/completions",
             {"model": self.model, "messages": [{"role": "user", "content": prompt}],
-             "temperature": 0, "max_tokens": self.max_tokens},
+             "temperature": 0, "max_tokens": self.max_tokens, **self.extra_body},
             {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"},
             self.timeout, sleep=self._sleep)
-        return reply["choices"][0]["message"]["content"] or ""
+        choice = (reply.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        content = message.get("content") or ""
+        finish = choice.get("finish_reason")
+        if content.strip():
+            return content
+        if finish == "content_filter":
+            raise JudgeRefused("the provider's content filter declined to answer")
+        only_reasoning = bool(message.get("reasoning") or message.get("reasoning_content"))
+        raise ValueError(
+            f"the model returned an empty answer (finish_reason: {finish}"
+            + ("; it produced only reasoning" if only_reasoning else "") + "). Reasoning models "
+            "spend the output budget on thinking: raise --max-tokens (for example 512) and lower "
+            "the effort with --extra-body, e.g. '{\"reasoning_effort\": \"low\"}' (Groq, Cerebras) "
+            "or '{\"reasoning\": {\"effort\": \"low\"}}' (OpenRouter). Or use a non-reasoning model.")
 
 
 class GeminiJudge(LLMJudge):
-    """Gemini API, native generateContent endpoint. The key is read from GEMINI_API_KEY (or
-    GOOGLE_API_KEY), sent in the x-goog-api-key header, and never written to disk or results.
+    """Gemini API, native generateContent endpoint (proprietary models; optional extra). The key is
+    read from GEMINI_API_KEY (or GOOGLE_API_KEY), sent in the x-goog-api-key header, and never
+    written to disk or results.
 
     Newer Gemini models "think" before answering by default, and thinking tokens count towards
-    maxOutputTokens. That is why max_tokens defaults to 1024 here instead of 8, and why
-    `thinking` is configurable:
+    maxOutputTokens. That is why max_tokens defaults to 1024 here, and why `thinking` is
+    configurable:
 
         omit     send no thinking setting (works with every model; the default)
         off      thinkingBudget = 0 (Gemini 2.5-style models that allow switching thinking off)
@@ -239,6 +366,9 @@ class GeminiJudge(LLMJudge):
         if not self.api_key:
             raise RuntimeError("set the GEMINI_API_KEY environment variable "
                                "(create a key in Google AI Studio)")
+
+    def settings(self) -> dict:
+        return {**super().settings(), "base_url": self.base_url, "thinking": self.thinking}
 
     def _generation_config(self) -> dict:
         config: dict = {"temperature": 0, "maxOutputTokens": self.max_tokens}
@@ -278,11 +408,27 @@ class GeminiJudge(LLMJudge):
             "or raise max_tokens")
 
 
-def make_judge(backend: str, model: str, host: str | None = None, **kwargs) -> LLMJudge:
+# ---------------------------------------------------------------- factory
+
+_COMMON_OPTIONS = {"cache_path", "min_interval", "tokens_per_minute", "max_tokens", "timeout"}
+
+
+def make_judge(backend: str, model: str, host: str | None = None, **options) -> LLMJudge:
+    """Build a judge. Unsupported options for a backend raise ValueError instead of being
+    silently ignored."""
+    def check(allowed: set[str]) -> None:
+        unknown = set(options) - allowed
+        if unknown:
+            raise ValueError(f"option(s) {sorted(unknown)} do not apply to the {backend!r} backend")
+
     if backend == "ollama":
-        return OllamaJudge(model, host or "http://localhost:11434", **kwargs)
-    if backend == "groq":
-        return GroqJudge(model, base_url=host or GROQ_BASE_URL, **kwargs)
+        check(_COMMON_OPTIONS)
+        return OllamaJudge(model, host or "http://localhost:11434", **options)
     if backend == "gemini":
-        return GeminiJudge(model, base_url=host or GEMINI_BASE_URL, **kwargs)
+        check(_COMMON_OPTIONS | {"thinking"})
+        return GeminiJudge(model, base_url=host or GEMINI_BASE_URL, **options)
+    if backend in PROVIDERS or backend == "openai-compatible":
+        check(_COMMON_OPTIONS | {"extra_body", "api_key_env"})
+        return OpenAICompatibleJudge(model, provider=backend if backend in PROVIDERS else None,
+                                     base_url=host, **options)
     raise ValueError(f"unknown backend {backend!r}, expected one of {BACKENDS}")
