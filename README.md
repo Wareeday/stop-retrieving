@@ -202,7 +202,7 @@ Python 3.10 or newer (developed and tested on 3.12).
 pip install -r requirements-dev.txt
 python -m stopret download      # 6 files, about 43 MB, SHA-256 verified
 python -m stopret run           # trajectories, CV, transfer, ablation, figures (about 2 min, 1 CPU core)
-python -m pytest                # 71 tests (plain `pytest` works too)
+python -m pytest                # 127 tests; plain `pytest` works too (5 need the `requests` library and are skipped without it)
 ```
 
 `python -m stopret report` redraws the figures and tables from `results/metrics.json` without
@@ -275,7 +275,19 @@ ones, and I would run one small and one large model on the same `--n` to show ho
 depends on the model. I have not measured this. Use the exact model id shown in the provider's
 console; ids change and old ones are retired.
 
-### Step 3: run it
+### Step 3: check your key and model id (costs no tokens)
+
+```bash
+export GROQ_API_KEY=...
+python -m stopret check --backend groq --model openai/gpt-oss-120b
+```
+
+This sends one request that only lists the models your key can use. It tells you whether the key
+is accepted, whether the connection works (a Cloudflare block shows up here, see the table at the
+end of this section), whether your model id exists, and suggests the closest ids if it does not.
+Add `--ping` to also ask one tiny real question (about 100 tokens) and see if the model answers YES.
+
+### Step 4: run it
 
 ```bash
 export MISTRAL_API_KEY=...            # keys come from each provider's console; never commit them
@@ -313,15 +325,20 @@ python -m stopret report              # adds an "LLM-judge" table to results/res
 | `--max-tokens` | output limit (default 16). Reasoning models need more, for example 512 |
 | `--extra-body` | JSON merged into the request, for provider-specific options such as the reasoning effort |
 | `--host`, `--api-key-env` | server URL and the name of the key's environment variable (generic backend) |
+| `--user-agent` | the User-Agent header. The default is a browser-like one (see "If something goes wrong"); `STOPRET_USER_AGENT` works too |
 | `--dry-run`, `--tpd`, `--rpd` | estimate only, see Step 1 |
 
-What the client does for you: it retries 429 and 5xx answers using the wait the server states, and
-stops with a clear message (instead of sleeping for hours) when the server asks for a long wait,
-for example when a daily limit is used up. Every answer is cached on disk under a hash of the full
+What the client does for you: it retries 429, 408 and 5xx answers, timeouts and dropped connections
+using the wait the server states, and stops with a clear message (instead of sleeping for hours)
+when the server asks for a long wait, for example when a daily limit is used up. A rejected key or
+a block (HTTP 401 or 403) stops the whole run at once, with no further questions tried. Every answer is cached on disk under a hash of the full
 prompt and all settings, so running the same command again, tomorrow if need be, resumes where it
 stopped and never reuses an answer given under different settings. If the model returns an empty
 answer because a reasoning model spent its whole output budget thinking, the run stops with advice
-on how to fix it instead of counting it as NO. If a provider refuses a prompt (for example a content
+on how to fix it instead of counting it as NO. A request that failed is never recorded as answered,
+so the next run asks that question again. A reply that is neither YES nor NO ("**YES**" and "Yes."
+are fine) counts as NO and is reported in the result; if the first five replies are like that the
+run stops, because the model is ignoring the instruction. If a provider refuses a prompt (for example a content
 filter), that hop counts as NO and the refusals are reported.
 
 The output (`results/llm_judge_<backend>_<model>.json`) has the judge's average hops and recall on
@@ -337,6 +354,13 @@ of the open-source setup; I kept it as an optional extra.
 
 | What you see | What it means and what to do |
 |---|---|
+| `STOP: API Key invalid or blocked by Cloudflare (1010)` | the server answered HTTP 401 or 403 and the run stopped at once (no further questions are tried, and the question that failed is asked again next time). The lines below the headline say which case it is. **Cloudflare error 1010** means the request was rejected for its browser signature: Python's default User-Agent (`Python-urllib/3.x`, or `python-requests/2.x` with the requests library) gets this on some APIs. This tool sends a browser-like User-Agent by default, so check that you did not set `--user-agent` or `STOPRET_USER_AGENT` yourself, switch off any VPN or proxy, try another network, and run `python -m stopret check --backend <name>`. If it still fails, compare with curl, which is installed on Fedora: `curl -sS -o /dev/null -w '%{http_code}\n' https://api.groq.com/openai/v1/models -H "Authorization: Bearer $GROQ_API_KEY"` (200 means key and network are fine), and try `--user-agent "curl/8.6.0"`, which many APIs accept |
+| `HTTP 401` below that headline | the key itself was rejected: copy it again, check that it is active in the console and belongs to this provider |
+| `... contains a space, line break or non-ASCII character` | the key was pasted with extra characters (curly quotes are common); copy it again. Surrounding quotes and line breaks are removed automatically |
+| `connection problem ... after 8 retries` or `could not reach` | no internet, DNS trouble or a firewall; the run retried with growing waits first. Nothing is lost, run it again |
+| `the TLS certificate ... could not be verified` | a VPN, proxy or antivirus is intercepting HTTPS, or the system clock is wrong |
+| `answered HTTP 200 but not with JSON` | something between you and the API (proxy, captive portal, challenge page) answered instead of the API |
+| `the model did not answer YES or NO in its first 5 replies` | the model ignores the instruction; pick another model, or check `--max-tokens` and `--extra-body` |
 | `stopped: ... Progress is cached; run the same command again later` | a rate limit was hit (often the daily token limit). Nothing is lost: run the same command later and it resumes from the cache |
 | `error: set the ..._API_KEY environment variable` | the key is not set in this terminal; `export` it again (a new terminal does not inherit it) |
 | `HTTP 401` | wrong or expired key |
@@ -388,11 +412,15 @@ stopret/
   experiments.py   every experiment in this README, the LLM-judge runner and the dry-run estimate
   plots.py, report.py, cli.py
   llm_judge.py     optional LLM-judge baseline: Ollama, free hosted APIs, generic OpenAI-compatible
-                   servers, Gemini; pacing, retries, cache
+                   servers, Gemini; pacing, cache, `check`
+  llm_http.py      the HTTP layer: browser User-Agent, retries, 401/403 stop, clear errors. Standard
+                   library only and self-contained, so the single file can be copied into another project
 scripts/hopeless_questions.py
-tests/             71 tests (BM25 vs rank_bm25, pipeline invariants, data integrity, mock-server tests)
+tests/             127 tests, 5 of them need `requests` (BM25 vs rank_bm25, pipeline invariants, data integrity, mock-server tests, Cloudflare simulation)
 results/           metrics.json, results_tables.md, figures, per-hop feature tables (CSV)
 requirements.txt, requirements-dev.txt, requirements-lock.txt, pytest.ini, Makefile, LICENSE
+CHANGES.md         the Cloudflare 1010 / 401 / 403 fix: cause, behaviour, exact lines changed
+extras/requests_client.py   the same behaviour for a project that uses the requests library (not imported here)
 ```
 
 ## Sources

@@ -1,0 +1,40 @@
+{
+ "backend": "gemini",
+ "model": "gemini-3.5-flash",
+ "n_questions": 5,
+ "base_url": "https://generativelanguage.googleapis.com/v1beta",
+ "settings": {
+  "min_interval": 1.2,
+  "tokens_per_minute": 250000
+ },
+ "thinking": null,
+ "llm_judge": {
+  "cost": 3.4,
+  "recall": 0.4
+ },
+ "vs_fixed_at_same_cost": {
+  "cost": 3.4,
+  "recall": 0.4,
+  "fixed_recall_same_cost": 0.4,
+  "diff": 0.0,
+  "diff_lo": 0.0,
+  "diff_hi": 0.08000000000000007
+ },
+ "fixed_hops_recall_at_same_cost": 0.4,
+ "learned_gbm_recall_at_same_cost": 0.4,
+ "oracle": {
+  "cost": 1.6,
+  "recall": 0.4
+ },
+ "stop_hop_per_question": [
+  4,
+  2,
+  4,
+  3,
+  4
+ ],
+ "refused_prompts_this_run": 0,
+ "requests_sent_this_run": 17,
+ "answers_from_cache_this_run": 0,
+ "approx_prompt_tokens_this_run": 15357
+}

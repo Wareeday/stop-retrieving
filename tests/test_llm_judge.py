@@ -6,9 +6,20 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
-from stopret.llm_judge import (BACKENDS, PROVIDERS, GeminiJudge, JudgeRefused, LLMJudge,
-                               OllamaJudge, OpenAICompatibleJudge, RateLimiter,
-                               RateLimitExhausted, build_prompt, estimate_tokens, make_judge)
+from stopret.llm_judge import (
+    BACKENDS,
+    PROVIDERS,
+    GeminiJudge,
+    JudgeRefused,
+    LLMJudge,
+    OllamaJudge,
+    OpenAICompatibleJudge,
+    RateLimiter,
+    RateLimitExhausted,
+    build_prompt,
+    estimate_tokens,
+    make_judge,
+)
 
 PASSAGES = [("X", "X was written by Y.")]
 
@@ -86,7 +97,9 @@ def test_build_prompt_contains_question_and_numbered_passages():
 
 def test_parse_strips_think_blocks_and_rejects_bad_answers():
     assert LLMJudge.parse(" Yes.") is True and LLMJudge.parse("NO") is False
-    assert LLMJudge.parse("I think so") is False
+    assert LLMJudge.parse("**YES**") is True and LLMJudge.parse('"No"') is False
+    assert LLMJudge.parse("YES, because both passages ...") is True
+    assert LLMJudge.parse("I think so") is None and LLMJudge.parse("Not enough") is None
     assert LLMJudge.parse("<think>hmm, maybe\nyes</think>\nYES") is True
     with pytest.raises(ValueError, match="cut off"):
         LLMJudge.parse("<think>still thinking about it")

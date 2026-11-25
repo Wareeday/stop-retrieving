@@ -143,3 +143,11 @@ Oracle: 18.2% recall at 1.18 average hops.
 | only structure | 3 | 0.805 | 63.2 ± 0.1 |
 | only question | 4 | 0.545 | 56.3 ± 0.2 |
 | only hop | 1 | 0.649 | 61.3 ± 0.1 |
+
+## LLM-judge stopping baseline (HotpotQA, same questions for every row)
+
+| Judge | questions | avg hops | recall % | fixed hops, same cost | difference vs fixed (pp, 95% CI) | learned (gbm), same cost | oracle | requests sent |
+|---|---:|---:|---:|---:|---|---:|---|---:|
+| gemini: gemini-3.5-flash | 5 | 3.40 | 40.0 | 40.0 | +0.0 [+0.0, +8.0] | 40.0 | 40.0 at 1.60 | 17 |
+
+'Requests sent' counts only the last run; answers already cached from an earlier run are not sent again.

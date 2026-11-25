@@ -127,6 +127,7 @@ def write_tables(metrics: dict, path: Path) -> None:
                    "requests sent |")
         out.append("|---|---:|---:|---:|---:|---|---:|---|---:|")
         declined = []
+        unparsed = []
         for f in judge_files:
             r = json.loads(f.read_text())
             think = r.get("thinking")
@@ -143,9 +144,14 @@ def write_tables(metrics: dict, path: Path) -> None:
                        f"{r['requests_sent_this_run']} |")
             if r.get("refused_prompts_this_run"):
                 declined.append(f.stem)
+            if r.get("unparsed_answers_this_run"):
+                unparsed.append(f"{f.stem} ({r['unparsed_answers_this_run']})")
         out.append("\n'Requests sent' counts only the last run; answers already cached from an "
                    "earlier run are not sent again.")
         if declined:
             out.append("Some judge prompts were declined by the provider and counted as NO: "
                        + ", ".join(declined) + ".")
+        if unparsed:
+            out.append("Some replies were neither YES nor NO and were counted as NO: "
+                       + ", ".join(unparsed) + ".")
     Path(path).write_text("\n".join(out) + "\n")

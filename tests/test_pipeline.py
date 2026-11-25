@@ -3,8 +3,13 @@ import copy
 import numpy as np
 import pytest
 
-from stopret.evaluation import (fixed_points, outcome, recall_at_budget, upper_hull)
-from stopret.features import FEATURE_NAMES, FeatureExtractor, build_table, normalize_title
+from stopret.evaluation import fixed_points, outcome, recall_at_budget, upper_hull
+from stopret.features import (
+    FEATURE_NAMES,
+    FeatureExtractor,
+    build_table,
+    normalize_title,
+)
 from stopret.policies import oracle_stops, stop_hops, stop_hops_giveup, to_matrix
 from stopret.trajectory import IterativeRetriever, RetrievalConfig
 

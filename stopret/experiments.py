@@ -11,8 +11,15 @@ import pandas as pd
 from sklearn.metrics import roc_auc_score
 
 from .data import DATASETS, load
-from .evaluation import (default_taus, fixed_points, frontier_auc, outcome,
-                         paired_bootstrap_vs_fixed, recall_at_budget, sweep)
+from .evaluation import (
+    default_taus,
+    fixed_points,
+    frontier_auc,
+    outcome,
+    paired_bootstrap_vs_fixed,
+    recall_at_budget,
+    sweep,
+)
 from .features import FEATURE_GROUPS, FEATURE_NAMES, build_table
 from .llm_judge import JudgeRefused, build_prompt, estimate_tokens, make_judge
 from .models import MODEL_KINDS, cross_val_predict, fit_predict
@@ -269,7 +276,7 @@ def run_llm_judge(backend: str, model: str, *, n_questions: int = 100, host: str
 
     If a provider declines to answer a prompt (e.g. a safety block), that hop counts as NO and is
     reported as a refusal. `judge_options` (min_interval, tokens_per_minute, max_tokens,
-    extra_body, api_key_env, thinking) are passed to the backend; options that do not apply to the
+    extra_body, api_key_env, thinking, user_agent) are passed to the backend; options that do not apply to the
     backend raise ValueError."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -316,6 +323,7 @@ def run_llm_judge(backend: str, model: str, *, n_questions: int = 100, host: str
         "oracle": dict(zip(("cost", "recall"), outcome(suff, oracle_stops(suff)), strict=True)),
         "stop_hop_per_question": stops.tolist(),
         "refused_prompts_this_run": judge.n_refused,
+        "unparsed_answers_this_run": judge.n_unparsed,
         "requests_sent_this_run": judge.n_calls,
         "answers_from_cache_this_run": judge.n_cache_hits,
         "approx_prompt_tokens_this_run": judge.prompt_chars // 4,

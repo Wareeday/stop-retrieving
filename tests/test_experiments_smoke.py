@@ -193,3 +193,77 @@ def test_cli_stops_cleanly_when_the_daily_limit_is_reached_and_on_config_errors(
     with pytest.raises(SystemExit, match="error: option"):
         main(base[:1] + ["--backend", "ollama", "--model", "m", "--thinking", "off",
                          "--data-dir", str(DATA), "--out-dir", str(workdir)])
+
+
+# ------------------------------------------------------------------ blocked key / Cloudflare 1010
+
+NO_REPLY = {"choices": [{"message": {"content": "NO"}, "finish_reason": "stop"}]}
+
+
+def test_a_blocked_key_stops_the_whole_run_and_the_failed_question_is_asked_again(
+        workdir, scripted_server):
+    from stopret.llm_http import AuthBlocked
+
+    mode = {"blocked": True}
+
+    def handler(index, request):
+        if mode["blocked"] and index == 2:                    # the third request ever sent
+            return 403, {}, "error code: 1010"
+        return 200, {}, NO_REPLY
+
+    server, log, url = scripted_server(handler)
+    kwargs = dict(n_questions=20, host=url, data_dir=str(DATA), out_dir=str(workdir), min_interval=0)
+    with pytest.raises(AuthBlocked, match="STOP: API Key invalid or blocked by Cloudflare"):
+        run_llm_judge("groq", "mock-model", **kwargs)
+    assert len(log) == 3                                       # nothing after the failure was tried
+    assert not list(workdir.glob("llm_judge_groq_mock-model*.json"))   # no result for a half run
+    cache = json.loads(next(workdir.glob("llm_judge_cache_groq_*.json")).read_text())
+    assert len(cache) == 2                                     # only the two real answers are saved
+
+    mode["blocked"] = False                                    # the problem is fixed; run again
+    result = run_llm_judge("groq", "mock-model", **kwargs)
+    assert result["answers_from_cache_this_run"] == 2
+    assert result["requests_sent_this_run"] == 20 * 4 - 2      # includes the question that failed
+    assert len(log) == 3 + 78 and result["llm_judge"]["cost"] == 4.0
+
+
+def test_cli_prints_the_stop_message_for_a_cloudflare_block_and_works_with_the_default_agent(
+        workdir, scripted_server):
+    def cloudflare(index, request):
+        if "python" in request["headers"].get("user-agent", "").lower():
+            return 403, {}, "error code: 1010"
+        return 200, {}, NO_REPLY
+
+    server, log, url = scripted_server(cloudflare)
+    base = ["judge", "--backend", "groq", "--host", url, "--model", "m", "--n", "3",
+            "--data-dir", str(DATA), "--out-dir", str(workdir), "--min-interval", "0"]
+    with pytest.raises(SystemExit) as blocked:
+        main(base + ["--user-agent", "python-requests/2.31"])
+    assert str(blocked.value).startswith("STOP: API Key invalid or blocked by Cloudflare (1010)")
+    assert "browser signature" in str(blocked.value) and len(log) == 1
+    main(base)                                                 # default (browser-like) agent
+    assert len(log) > 1 and log[-1]["headers"]["user-agent"].startswith("Mozilla/5.0")
+
+
+def test_cli_check_command(workdir, scripted_server, capsys):
+    server, log, url = scripted_server(
+        lambda i, r: (200, {}, {"data": [{"id": "openai/gpt-oss-120b"}, {"id": "other-model"}]}))
+    base = ["check", "--backend", "groq", "--host", url]
+    main(base + ["--model", "openai/gpt-oss-120b"])
+    out = capsys.readouterr().out
+    assert "OK: key accepted" in out and "2 model ids" in out and "exists" in out
+    main(base + ["--model", "gpt-oss-120b"])
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "did you mean: openai/gpt-oss-120b" in out
+    with pytest.raises(SystemExit):
+        main(["check"])                                       # no backend
+    server2, log2, url2 = scripted_server(lambda i, r: (401, {}, '{"error": "bad key"}'))
+    with pytest.raises(SystemExit, match="STOP: API Key invalid"):
+        main(["check", "--backend", "groq", "--host", url2])
+
+
+def test_cli_rejects_nonsense_numbers(workdir):
+    for flag, value in [("--n", "0"), ("--rpm", "-5"), ("--max-tokens", "abc"),
+                        ("--tokens-per-minute", "0"), ("--min-interval", "-1")]:
+        with pytest.raises(SystemExit):
+            main(["judge", "--backend", "groq", "--model", "m", flag, value])

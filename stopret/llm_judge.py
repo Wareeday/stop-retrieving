@@ -24,16 +24,27 @@ Run `python -m stopret judge ...` to get one.
 """
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import math
 import os
 import re
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+
+from .llm_http import (  # noqa: F401
+    DEFAULT_USER_AGENT,
+    USER_AGENT_ENV,
+    ApiError,
+    AuthBlocked,
+    RateLimitExhausted,
+    clean_api_key,
+    get_json,
+    post_json,
+    resolve_user_agent,
+)
 
 PROMPT = """You are checking retrieved evidence for a multi-hop question.
 
@@ -72,11 +83,6 @@ GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 THINKING_CHOICES = ("omit", "off", "minimal", "low", "medium", "high")
 
 
-class RateLimitExhausted(RuntimeError):
-    """The server keeps refusing for rate-limit reasons, or asked us to wait longer than we are
-    willing to (for example a daily quota)."""
-
-
 class JudgeRefused(ValueError):
     """The provider declined to answer this particular prompt (e.g. a safety block)."""
 
@@ -88,62 +94,6 @@ def estimate_tokens(text: str) -> int:
 def build_prompt(question: str, passages: list[tuple[str, str]]) -> str:
     text = "\n".join(f"[{i}] {title}: {body}" for i, (title, body) in enumerate(passages, 1))
     return PROMPT.format(question=question, passages=text)
-
-
-# ---------------------------------------------------------------- HTTP with retries
-
-def _retry_delay_from_body(raw: bytes) -> float | None:
-    """Google-style 429 bodies carry the wait in error.details[].retryDelay, e.g. '34s'."""
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        return None
-    error = data.get("error") if isinstance(data, dict) else None
-    for detail in (error or {}).get("details") or []:
-        delay = detail.get("retryDelay") if isinstance(detail, dict) else None
-        match = re.fullmatch(r"([0-9.]+)s", delay or "")
-        if match:
-            return float(match.group(1))
-    return None
-
-
-def _post_json(url: str, payload: dict, headers: dict, timeout: float, max_retries: int = 8,
-               max_wait: float = 120.0, sleep=time.sleep) -> dict:
-    """POST JSON and return the decoded reply. Retries 429 and 5xx responses and connection
-    errors, waiting as long as the server says (Retry-After header, or retryDelay in the body)
-    and otherwise backing off exponentially. If the server asks for a wait longer than
-    `max_wait` seconds, or keeps answering 429 after all retries, raise RateLimitExhausted
-    instead of sleeping for hours."""
-    body = json.dumps(payload).encode()
-    for attempt in range(max_retries + 1):
-        request = urllib.request.Request(url, data=body, headers=headers)
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return json.loads(response.read())
-        except urllib.error.HTTPError as err:
-            raw = err.read()
-            retryable = err.code == 429 or err.code >= 500
-            if not retryable or attempt == max_retries:
-                if err.code == 429:
-                    raise RateLimitExhausted(
-                        f"still rate limited after {attempt} retries. Progress is cached; run "
-                        "the same command again later and it will resume.") from err
-                raise RuntimeError(
-                    f"HTTP {err.code} from {url}: {raw.decode(errors='replace')[:300]}") from err
-            retry_after = err.headers.get("Retry-After")
-            wait = float(retry_after) if retry_after else _retry_delay_from_body(raw)
-            if wait is None:
-                wait = min(2.0 ** attempt, 60.0)
-            if wait > max_wait:
-                raise RateLimitExhausted(
-                    f"server asked to wait {wait:.0f}s (limit reached). Progress is cached; "
-                    "run the same command again later and it will resume.") from err
-        except urllib.error.URLError as err:
-            if attempt == max_retries:
-                raise RuntimeError(f"could not reach {url}: {err.reason}") from err
-            wait = min(2.0 ** attempt, 60.0)
-        sleep(wait)
-    raise AssertionError("unreachable")
 
 
 # ---------------------------------------------------------------- pacing
@@ -186,14 +136,17 @@ class LLMJudge:
 
     def __init__(self, model: str, cache_path: str | Path | None = None,
                  min_interval: float = 0.0, tokens_per_minute: int | None = None,
-                 timeout: float = 300.0, max_tokens: int = 16, clock=time.monotonic,
-                 sleep=time.sleep):
+                 timeout: float = 300.0, max_tokens: int = 16, user_agent: str | None = None,
+                 clock=time.monotonic, sleep=time.sleep):
         self.model, self.timeout, self.max_tokens = model, timeout, max_tokens
+        self.user_agent = resolve_user_agent(user_agent)
         self._sleep = sleep
         self.limiter = RateLimiter(min_interval, tokens_per_minute, clock, sleep)
         self.n_calls = 0              # requests actually sent (cache hits are not counted)
         self.n_cache_hits = 0
         self.n_refused = 0            # prompts the provider declined to answer
+        self.n_parsed = 0             # replies that were a clear YES or NO
+        self.n_unparsed = 0           # replies that were neither (counted as NO and reported)
         self.prompt_chars = 0         # characters sent, for a rough token estimate
         self.cache_path = Path(cache_path) if cache_path else None
         self.cache: dict[str, bool] = self._load_cache()
@@ -230,8 +183,12 @@ class LLMJudge:
 
     # --- answer parsing
     @staticmethod
-    def parse(answer: str) -> bool:
-        """YES/NO from the model's reply. Reasoning models may emit <think>...</think> first."""
+    def parse(answer: str) -> bool | None:
+        """True for YES, False for NO, None when the reply is neither.
+
+        The first word decides, ignoring leading quotes, asterisks and punctuation, so "Yes.",
+        "**YES**" and "\"No\"" all work. Reasoning models may emit <think>...</think> first; a reply
+        that is empty or cut off inside the thinking is an error (not a silent NO)."""
         cleaned = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
         if "<think>" in cleaned:  # cut off inside the reasoning, e.g. by max_tokens
             raise ValueError(
@@ -241,7 +198,9 @@ class LLMJudge:
             raise ValueError(
                 "the model returned an empty answer; use a non-reasoning (instruct) model, "
                 "or raise max_tokens")
-        return cleaned.upper().startswith("YES")
+        match = re.match(r"[^A-Za-z]*([A-Za-z]+)", cleaned)
+        word = match.group(1).upper() if match else ""
+        return True if word == "YES" else False if word == "NO" else None
 
     def is_sufficient(self, question: str, passages: list[tuple[str, str]]) -> bool:
         prompt = build_prompt(question, passages)
@@ -253,13 +212,34 @@ class LLMJudge:
         self.n_calls += 1
         self.prompt_chars += len(prompt)
         try:
-            verdict = self.parse(self._complete(prompt))
+            reply = self._complete(prompt)
+            verdict = self.parse(reply)
         except JudgeRefused:
             self.n_refused += 1
             raise
+        if verdict is None:
+            # Neither YES nor NO. Count it as NO, report it, and do not cache it, so a rerun asks
+            # again. If the very first replies are all like this, the model ignores the
+            # instruction and continuing would only burn quota.
+            self.n_unparsed += 1
+            if self.n_parsed == 0 and self.n_unparsed >= 5:
+                raise ValueError(
+                    "the model did not answer YES or NO in its first 5 replies (the last one "
+                    f"began: {' '.join(reply.split())[:80]!r}). Choose another model, or check "
+                    "--max-tokens and --extra-body.")
+            return False
+        self.n_parsed += 1
         self.cache[key] = verdict
         self._save_cache()
         return verdict
+
+    # --- helpers for `python -m stopret check`
+    def list_models(self) -> list[str]:
+        raise NotImplementedError
+
+    def _http(self, headers: dict) -> dict:
+        return {"headers": headers, "timeout": self.timeout, "sleep": self._sleep,
+                "user_agent": self.user_agent}
 
 
 class OllamaJudge(LLMJudge):
@@ -270,12 +250,16 @@ class OllamaJudge(LLMJudge):
         self.host = host.rstrip("/")
 
     def _complete(self, prompt: str) -> str:
-        reply = _post_json(
+        reply = post_json(
             f"{self.host}/api/generate",
             {"model": self.model, "prompt": prompt, "stream": False,
              "options": {"temperature": 0, "num_predict": self.max_tokens}},
-            {"Content-Type": "application/json"}, self.timeout, sleep=self._sleep)
+            **self._http({}))
         return reply["response"]
+
+    def list_models(self) -> list[str]:
+        reply = get_json(f"{self.host}/api/tags", **self._http({}))
+        return [m.get("name", "") for m in reply.get("models", [])]
 
 
 class OpenAICompatibleJudge(LLMJudge):
@@ -298,11 +282,12 @@ class OpenAICompatibleJudge(LLMJudge):
             raise ValueError("an OpenAI-compatible backend needs a base URL (--host)")
         self.base_url = base_url.rstrip("/")
         key_env = api_key_env or (preset.key_env if preset else None)
-        self.api_key = api_key or (os.environ.get(key_env) if key_env else None)
-        if not self.api_key:
+        raw_key = api_key or (os.environ.get(key_env) if key_env else None)
+        if raw_key is None:
             raise RuntimeError(
                 f"set the {key_env or 'API key'} environment variable"
                 + ("" if key_env else " and pass its name with --api-key-env"))
+        self.api_key = clean_api_key(raw_key, key_env or "the API key")
         self.extra_body = dict(extra_body or {})
         for reserved in ("model", "messages"):
             if reserved in self.extra_body:
@@ -312,12 +297,11 @@ class OpenAICompatibleJudge(LLMJudge):
         return {**super().settings(), "base_url": self.base_url, "extra_body": self.extra_body}
 
     def _complete(self, prompt: str) -> str:
-        reply = _post_json(
+        reply = post_json(
             f"{self.base_url}/chat/completions",
             {"model": self.model, "messages": [{"role": "user", "content": prompt}],
              "temperature": 0, "max_tokens": self.max_tokens, **self.extra_body},
-            {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"},
-            self.timeout, sleep=self._sleep)
+            **self._http({"Authorization": f"Bearer {self.api_key}"}))
         choice = (reply.get("choices") or [{}])[0]
         message = choice.get("message") or {}
         content = message.get("content") or ""
@@ -333,6 +317,12 @@ class OpenAICompatibleJudge(LLMJudge):
             "spend the output budget on thinking: raise --max-tokens (for example 512) and lower "
             "the effort with --extra-body, e.g. '{\"reasoning_effort\": \"low\"}' (Groq, Cerebras) "
             "or '{\"reasoning\": {\"effort\": \"low\"}}' (OpenRouter). Or use a non-reasoning model.")
+
+
+    def list_models(self) -> list[str]:
+        reply = get_json(f"{self.base_url}/models",
+                         **self._http({"Authorization": f"Bearer {self.api_key}"}))
+        return [m.get("id", "") for m in reply.get("data", [])]
 
 
 class GeminiJudge(LLMJudge):
@@ -362,10 +352,11 @@ class GeminiJudge(LLMJudge):
             raise ValueError(f"thinking must be one of {THINKING_CHOICES}, got {thinking!r}")
         self.thinking = thinking
         self.base_url = base_url.rstrip("/")
-        self.api_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-        if not self.api_key:
+        raw_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if raw_key is None:
             raise RuntimeError("set the GEMINI_API_KEY environment variable "
                                "(create a key in Google AI Studio)")
+        self.api_key = clean_api_key(raw_key, "GEMINI_API_KEY")
 
     def settings(self) -> dict:
         return {**super().settings(), "base_url": self.base_url, "thinking": self.thinking}
@@ -380,13 +371,16 @@ class GeminiJudge(LLMJudge):
 
     def _complete(self, prompt: str) -> str:
         model = self.model.removeprefix("models/")
-        reply = _post_json(
+        reply = post_json(
             f"{self.base_url}/models/{model}:generateContent",
             {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
              "generationConfig": self._generation_config()},
-            {"Content-Type": "application/json", "x-goog-api-key": self.api_key},
-            self.timeout, sleep=self._sleep)
+            **self._http({"x-goog-api-key": self.api_key}))
         return self._extract_text(reply)
+
+    def list_models(self) -> list[str]:
+        reply = get_json(f"{self.base_url}/models", **self._http({"x-goog-api-key": self.api_key}))
+        return [m.get("name", "").removeprefix("models/") for m in reply.get("models", [])]
 
     @staticmethod
     def _extract_text(reply: dict) -> str:
@@ -410,7 +404,8 @@ class GeminiJudge(LLMJudge):
 
 # ---------------------------------------------------------------- factory
 
-_COMMON_OPTIONS = {"cache_path", "min_interval", "tokens_per_minute", "max_tokens", "timeout"}
+_COMMON_OPTIONS = {"cache_path", "min_interval", "tokens_per_minute", "max_tokens", "timeout",
+                   "user_agent"}
 
 
 def make_judge(backend: str, model: str, host: str | None = None, **options) -> LLMJudge:
@@ -432,3 +427,28 @@ def make_judge(backend: str, model: str, host: str | None = None, **options) -> 
         return OpenAICompatibleJudge(model, provider=backend if backend in PROVIDERS else None,
                                      base_url=host, **options)
     raise ValueError(f"unknown backend {backend!r}, expected one of {BACKENDS}")
+
+
+def check_backend(backend: str, model: str | None = None, host: str | None = None, *,
+                  ping: bool = False, **options) -> dict:
+    """Test the key, the network path and (optionally) a model id with a request that costs no
+    tokens: the provider's model list. With `ping=True` one tiny real question is asked as well.
+    Raises the same errors as a normal run (AuthBlocked for a rejected key or a Cloudflare
+    block, ApiError for anything else), so the message tells you what to fix."""
+    judge = make_judge(backend, model or "unused", host, **options)
+    models = judge.list_models()
+    result: dict = {"backend": backend, "models_available": len(models),
+                    "sample_models": sorted(models)[:40], "model": model, "model_found": None,
+                    "close_matches": []}
+    if model:
+        result["model_found"] = model in models
+        if not result["model_found"]:
+            result["close_matches"] = difflib.get_close_matches(model, models, n=5, cutoff=0.4)
+    if ping:
+        if not model:
+            raise ValueError("--ping needs --model")
+        started = time.monotonic()
+        answer = judge.is_sufficient("What is 2 + 2?", [("Arithmetic", "2 + 2 equals 4.")])
+        result["ping"] = {"answered_yes": answer, "seconds": round(time.monotonic() - started, 2),
+                          "unparsed": judge.n_unparsed}
+    return result
