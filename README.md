@@ -433,3 +433,6 @@ extras/requests_client.py   the same behaviour for a project that uses the reque
 - Provider limits in the LLM-judge section: Groq's rate-limit documentation, Mistral's help centre,
   Cerebras documentation and third-party trackers, read in autumn 2026. They change; check your
   own console.
+
+  ## Licence
+  MIT

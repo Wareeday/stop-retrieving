@@ -149,5 +149,6 @@ Oracle: 18.2% recall at 1.18 average hops.
 | Judge | questions | avg hops | recall % | fixed hops, same cost | difference vs fixed (pp, 95% CI) | learned (gbm), same cost | oracle | requests sent |
 |---|---:|---:|---:|---:|---|---:|---|---:|
 | gemini: gemini-3.5-flash | 5 | 3.40 | 40.0 | 40.0 | +0.0 [+0.0, +8.0] | 40.0 | 40.0 at 1.60 | 17 |
+| groq: openai/gpt-oss-120b | 100 | 2.10 | 61.0 | 62.8 | -1.8 [-8.7, +5.6] | 65.3 | 74.0 at 1.55 | 120 |
 
 'Requests sent' counts only the last run; answers already cached from an earlier run are not sent again.
