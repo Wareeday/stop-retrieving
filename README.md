@@ -217,7 +217,7 @@ identical, and gradient-boosting results move slightly because scikit-learn chan
 versions: AUC by at most 0.1 points, recall at a given budget by at most 0.2 points, and the
 differences to the fixed-hop baseline in the tables by at most 0.3 points. No conclusion changes.
 
-## LLM-judge baseline (optional, not run yet)
+## LLM-judge baseline
 
 The comparison I wanted from the start: after every hop, ask an LLM "is this evidence enough to
 answer the question?" and stop at the first YES. It costs one LLM request per hop, which is exactly
@@ -433,6 +433,3 @@ extras/requests_client.py   the same behaviour for a project that uses the reque
 - Provider limits in the LLM-judge section: Groq's rate-limit documentation, Mistral's help centre,
   Cerebras documentation and third-party trackers, read in autumn 2026. They change; check your
   own console.
-
-  ## Licence
-  MIT
